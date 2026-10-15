@@ -69,6 +69,7 @@ resource "huaweicloud_cce_autopilot_cluster" "prod_k8s" {
   lifecycle {
     ignore_changes = [
       enable_snat, delete_efs, delete_obs, # Tells Terraform to stop trying to "correct" these three fields after creation — Huawei's API doesn't return their real value on import, so Terraform can't reliably track drift on them.
+      tags,                                # Huawei adds a CCE-Cluster-ID tag itself after creation; without this Terraform tries to remove it on every plan.
     ]
   }
 }
