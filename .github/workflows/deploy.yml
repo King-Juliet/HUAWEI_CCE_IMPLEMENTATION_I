@@ -270,28 +270,37 @@ jobs:
           kubectl get --raw /readyz || true
           exit 1
 
+      # Every cluster call below goes through retry(): the public API address sometimes refuses a
+      # connection for a few seconds even right after answering, and one refused call must not fail
+      # the whole bootstrap. Only connection errors are retried (see .github/scripts/retry.sh).
       - name: Create namespaces and GitHub credential secret
         env:
           ARC_GITHUB_TOKEN: ${{ secrets.ARC_GITHUB_TOKEN }}
         run: |
           set -e
+          . .github/scripts/retry.sh
           [ -n "$ARC_GITHUB_TOKEN" ] || { echo "::error::repository secret ARC_GITHUB_TOKEN is missing"; exit 1; }
-          kubectl create namespace arc-systems --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create namespace arc-runners --dry-run=client -o yaml | kubectl apply -f -
+          retry bash -c 'kubectl create namespace arc-systems --dry-run=client -o yaml | kubectl apply -f -'
+          retry bash -c 'kubectl create namespace arc-runners --dry-run=client -o yaml | kubectl apply -f -'
           # rbac.yaml grants Gateway permissions in this namespace, so it must exist first
           # (harmless if Envoy Gateway already created it).
-          kubectl create namespace envoy-gateway-system --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create secret generic imto-arc-github-app \
+          retry bash -c 'kubectl create namespace envoy-gateway-system --dry-run=client -o yaml | kubectl apply -f -'
+          retry bash -c 'kubectl create secret generic imto-arc-github-app \
             --namespace arc-runners \
             --from-literal=github_token="$ARC_GITHUB_TOKEN" \
-            --dry-run=client -o yaml | kubectl apply -f -
+            --dry-run=client -o yaml | kubectl apply -f -'
 
       - name: Apply runner RBAC
-        run: kubectl apply -f platform/arc/rbac.yaml
+        run: |
+          set -e
+          . .github/scripts/retry.sh
+          retry kubectl apply -f platform/arc/rbac.yaml
 
       - name: Install ARC controller
         run: |
-          helm upgrade --install arc \
+          set -e
+          . .github/scripts/retry.sh
+          retry helm upgrade --install arc \
             --namespace arc-systems \
             -f platform/arc/controller-values.yaml \
             --version "$ARC_VERSION" \
@@ -300,7 +309,9 @@ jobs:
 
       - name: Install ARC runner scale set
         run: |
-          helm upgrade --install imto-arc-runners \
+          set -e
+          . .github/scripts/retry.sh
+          retry helm upgrade --install imto-arc-runners \
             --namespace arc-runners \
             -f platform/arc/runner-scale-set-values.yaml \
             --set githubConfigUrl="https://github.com/${{ github.repository }}" \
@@ -327,12 +338,13 @@ jobs:
       - name: Install Envoy Gateway
         run: |
           set -e
+          . .github/scripts/retry.sh
           kubectl version | grep -i "server version" || true
-          helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+          retry helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
             --version "$ENVOY_GATEWAY_VERSION" \
             --namespace envoy-gateway-system --create-namespace \
             --timeout 8m
-          kubectl wait --timeout=5m -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
+          retry kubectl wait --timeout=5m -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
 
       # If anything above failed, print the cluster state into this log while access is still open.
       - name: Capture cluster diagnostics
