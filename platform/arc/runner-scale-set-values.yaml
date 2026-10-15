@@ -16,8 +16,10 @@ runnerScaleSetName: imto-arc-runners
 minRunners: 0 # scale to zero when idle — CCE Autopilot bills per pod, no CI activity = no cost
 maxRunners: 3 # starter concurrency cap — raise once real pipeline volume is known
 
-containerMode:
-  type: kubernetes # each job step needing its own container gets a pod, rather than a privileged DinD sidecar
+# No containerMode on purpose. The deploy job only runs plain steps (checkout, kubectl), so it runs
+# directly inside the runner pod as imto-arc-runner-sa. "kubernetes" mode would need a work-volume
+# storage class (kubernetesModeWorkVolumeClaim) that this job does not use, and the chart rejects
+# the install without it.
 
 template:
   spec:
@@ -28,11 +30,6 @@ template:
       - name: runner
         image: ghcr.io/actions/actions-runner:latest
         command: ["/home/runner/run.sh"]
-        env:
-          # Lets the deploy job run its steps directly in the runner pod (as imto-arc-runner-sa)
-          # instead of ARC demanding a separate job container for every job.
-          - name: ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER
-            value: "false"
         resources:
           requests:
             cpu: "250m"

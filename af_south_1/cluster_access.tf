@@ -1,6 +1,8 @@
 # Temporary public access to the kube-apiserver — used ONLY by the CD pipeline's one-time
-# ARC bootstrap job, which sets cluster_public_access=true, installs ARC, then applies again
-# with the default (false) so the EIP is unbound and destroyed. Normal state: private.
+# ARC bootstrap job, which sets cluster_public_access=true, installs ARC, then closes access in
+# two applies: first keep_temp_eip=true (EIP detached from the cluster but not yet deleted), then
+# the default (both false) so the now-detached EIP is destroyed. Doing it in two steps stops
+# Terraform trying to delete the EIP while it is still attached. Normal state: private.
 
 variable "cluster_public_access" {
   description = "Bind a temporary EIP to the kube-apiserver. Set to true only by the CD bootstrap job."
@@ -8,8 +10,14 @@ variable "cluster_public_access" {
   default     = false
 }
 
+variable "keep_temp_eip" {
+  description = "Keep the temporary EIP in existence while it is detached from the cluster. Only used by the CD pipeline's two-step close."
+  type        = bool
+  default     = false
+}
+
 resource "huaweicloud_vpc_eip" "api_temp" {
-  count = var.cluster_public_access ? 1 : 0
+  count = (var.cluster_public_access || var.keep_temp_eip) ? 1 : 0
 
   name = "juliet-cce-api-temp-eip"
 

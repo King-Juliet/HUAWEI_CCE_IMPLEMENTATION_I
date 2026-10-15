@@ -82,6 +82,28 @@ jobs:
           fi
           echo "install=$INSTALL" >> "$GITHUB_OUTPUT"
 
+      # A failed ARC bootstrap can leave the temporary API IP attached to the cluster. If one is
+      # found in state, detach it from the cluster first (the IP is kept for that apply), then
+      # delete it, retrying while Huawei finishes the detach. This changes state, so the saved
+      # plan from CI is stale afterwards and the next step applies a fresh plan instead.
+      - name: Clean up leftover temporary API access
+        id: leftover
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          CLEANED=false
+          if terraform state list | grep -q '^huaweicloud_vpc_eip\.api_temp'; then
+            echo "Leftover temporary API IP found - detaching it from the cluster first."
+            terraform apply -auto-approve -var="keep_temp_eip=true"
+            DONE=false
+            for i in $(seq 1 10); do
+              if terraform apply -auto-approve; then DONE=true; break; fi
+              echo "EIP still busy, retrying ($i/10)"; sleep 30
+            done
+            [ "$DONE" = "true" ] || { echo "::error::could not delete the temporary API IP"; exit 1; }
+            CLEANED=true
+          fi
+          echo "cleaned=$CLEANED" >> "$GITHUB_OUTPUT"
+
       # If a previous run left the temporary API IP half-detached, the saved plan can fail with
       # a "conflict" while Huawei finishes detaching it. Wait a minute and apply once more with a
       # fresh plan, which sees the real current state.
@@ -89,11 +111,16 @@ jobs:
         if: steps.download.outcome == 'success'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          terraform apply -auto-approve tfplan || {
-            echo "Saved plan failed - waiting 60s, then retrying with a fresh plan."
-            sleep 60
+          if [ "${{ steps.leftover.outputs.cleaned }}" = "true" ]; then
+            echo "State changed during cleanup - saved plan is stale, applying a fresh plan."
             terraform apply -auto-approve
-          }
+          else
+            terraform apply -auto-approve tfplan || {
+              echo "Saved plan failed - waiting 60s, then retrying with a fresh plan."
+              sleep 60
+              terraform apply -auto-approve
+            }
+          fi
 
       - name: Read SWR login project name from Terraform state
         id: project_name
@@ -283,8 +310,8 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           rm -f "$RUNNER_TEMP/kubeconfig"
-          # 1) detach the EIP from the cluster first, on its own
-          terraform apply -auto-approve -target=module.juliet_cce_autopilot.huaweicloud_cce_autopilot_cluster.prod_k8s
+          # 1) detach the EIP from the cluster; keep_temp_eip stops Terraform deleting it in the same apply
+          terraform apply -auto-approve -var="keep_temp_eip=true"
           # 2) then delete the now-unattached EIP; retry because the detach finishes in the background
           for i in $(seq 1 10); do
             if terraform apply -auto-approve; then
