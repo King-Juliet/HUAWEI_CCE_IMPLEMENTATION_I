@@ -22,7 +22,7 @@ module "juliet_cce_autopilot" {
     module.juliet_eni_subnet.subnet_ipv4_subnet_id, # pod networking — dedicated private subnet, ipv4_subnet_id (not plain id)
   ]
 
-  eip_id = null # keep the kube-apiserver endpoint private — no direct public access to the API server
+  eip_id = var.cluster_public_access ? huaweicloud_vpc_eip.api_temp[0].id : null # private by default; the CD pipeline binds a temporary EIP only during the one-time ARC install (see cluster_access.tf)
 
   enable_snat             = true  # pods reach third-party systems outbound via the NAT Gateway below
   enable_swr_image_access = true  # pull images from SWR over a private VPC endpoint rather than the public internet

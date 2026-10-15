@@ -86,7 +86,7 @@ module "juliet_rds_postgres" {
   accounts = {
     imto_app = {
       password    = random_password.imto_app_db.result
-      description = "App account for the IMTO test backend — least-privilege, not the admin account"
+      description = "App account for the IMTO test backend" # plain words only - the old text with a comma and an em dash was rejected (DBS.301161)
     }
   }
 

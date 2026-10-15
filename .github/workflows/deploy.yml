@@ -6,10 +6,16 @@ on:
     types: [completed]
     branches: [main]
 
+# One CD run at a time: they all read and write the same Terraform state.
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
 env:
   SWR_REGISTRY: swr.af-south-1.myhuaweicloud.com
   SWR_ORGANIZATION: juliet-cce
   TF_WORKING_DIR: af_south_1
+  ARC_VERSION: 0.15.0
 
 jobs:
   terraform-apply:
@@ -22,6 +28,7 @@ jobs:
       contents: read
     outputs:
       swr_project_name: ${{ steps.project_name.outputs.value }}
+      bootstrap_arc: ${{ steps.arc.outputs.install }}
     env:
       HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
       HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
@@ -33,6 +40,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 2
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -52,6 +60,26 @@ jobs:
       - name: Terraform init
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform init
+
+      # ARC (the in-cluster runner that performs `deploy`) is installed automatically when
+      # (a) this run is creating the cluster, or (b) the commit changed platform/arc/.
+      # Every other run skips the install, so the API server stays private.
+      - name: Decide whether ARC must be installed
+        id: arc
+        run: |
+          INSTALL=false
+          if [ "${{ steps.download.outcome }}" = "success" ]; then
+            if (cd "$TF_WORKING_DIR" && terraform show -json tfplan) \
+               | jq -e '[.resource_changes[]? | select(.type=="huaweicloud_cce_autopilot_cluster") | select(.change.actions | index("create"))] | length > 0' > /dev/null; then
+              echo "Plan creates the cluster -> ARC install needed."
+              INSTALL=true
+            fi
+          fi
+          if git diff-tree --no-commit-id --name-only -r "${{ github.event.workflow_run.head_sha }}" | grep -q '^platform/arc/'; then
+            echo "platform/arc/ changed in this commit -> ARC install needed."
+            INSTALL=true
+          fi
+          echo "install=$INSTALL" >> "$GITHUB_OUTPUT"
 
       - name: Terraform apply
         if: steps.download.outcome == 'success'
@@ -123,15 +151,177 @@ jobs:
           push: true
           tags: ${{ env.SWR_REGISTRY }}/${{ env.SWR_ORGANIZATION }}/imto-test-${{ matrix.component }}:${{ steps.vars.outputs.tag }}
 
-  deploy:
-    needs: [terraform-apply, build-and-push]
-    runs-on: imto-arc-runners
+  arc-bootstrap:
+    needs: terraform-apply
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      needs.terraform-apply.outputs.bootstrap_arc == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
     env:
-      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+      HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
+      HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.HW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      # The cluster API server is private. For the duration of this job only, Terraform binds a
+      # temporary EIP to it so this GitHub-hosted runner can reach it. The last step of the job
+      # (which always runs) applies again with the default value and removes the EIP.
+      - name: Open temporary API access
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -var="cluster_public_access=true"
+
+      - name: Fetch short-lived kubeconfig
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set -e
+          terraform output -raw bootstrap_kubeconfig > "$RUNNER_TEMP/kubeconfig"
+          chmod 600 "$RUNNER_TEMP/kubeconfig"
+          [ -s "$RUNNER_TEMP/kubeconfig" ] || { echo "::error::kubeconfig is empty - the cluster certificate data source returned nothing"; exit 1; }
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Wait for the API server to answer
+        run: |
+          kubectl config get-contexts
+          kubectl config use-context external
+          for i in $(seq 1 30); do
+            if kubectl get --raw /readyz > /dev/null 2>&1; then echo "API server reachable"; exit 0; fi
+            echo "not reachable yet ($i/30)"; sleep 10
+          done
+          kubectl get --raw /readyz || true
+          exit 1
+
+      - name: Create namespaces and GitHub credential secret
+        env:
+          ARC_GITHUB_TOKEN: ${{ secrets.ARC_GITHUB_TOKEN }}
+        run: |
+          set -e
+          [ -n "$ARC_GITHUB_TOKEN" ] || { echo "::error::repository secret ARC_GITHUB_TOKEN is missing"; exit 1; }
+          kubectl create namespace arc-systems --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace arc-runners --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic imto-arc-github-app \
+            --namespace arc-runners \
+            --from-literal=github_token="$ARC_GITHUB_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply runner RBAC
+        run: kubectl apply -f platform/arc/rbac.yaml
+
+      - name: Install ARC controller
+        run: |
+          helm upgrade --install arc \
+            --namespace arc-systems \
+            -f platform/arc/controller-values.yaml \
+            --version "$ARC_VERSION" \
+            --wait --timeout 5m \
+            oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+
+      - name: Install ARC runner scale set
+        run: |
+          helm upgrade --install imto-arc-runners \
+            --namespace arc-runners \
+            -f platform/arc/runner-scale-set-values.yaml \
+            --set githubConfigUrl="https://github.com/${{ github.repository }}" \
+            --version "$ARC_VERSION" \
+            oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+
+      - name: Wait for the runner listener
+        run: |
+          for i in $(seq 1 30); do
+            if kubectl get pods -n arc-systems --no-headers | grep listener | grep -q Running; then
+              echo "ARC listener is running - runner scale set is registered with GitHub"
+              kubectl get pods -A
+              exit 0
+            fi
+            echo "listener not running yet ($i/30)"; sleep 10
+          done
+          kubectl get pods -A || true
+          kubectl logs -n arc-systems -l app.kubernetes.io/name=gha-rs-controller --tail=80 || true
+          exit 1
+
+      - name: Close temporary API access
+        if: always()
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig"
+          terraform apply -auto-approve
+          echo "API server is private again."
+
+      - name: Keep errored state if it could not be saved
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: errored-tfstate-arc
+          path: ${{ env.TF_WORKING_DIR }}/errored.tfstate
+          retention-days: 1
+          if-no-files-found: ignore
+
+  deploy:
+    needs: [terraform-apply, build-and-push, arc-bootstrap]
+    # arc-bootstrap is skipped on most runs; always() stops that skip from skipping deploy too.
+    if: >
+      always() &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      needs.terraform-apply.result == 'success' &&
+      needs.build-and-push.result == 'success' &&
+      (needs.arc-bootstrap.result == 'success' || needs.arc-bootstrap.result == 'skipped')
+    # Matches runnerScaleSetName in platform/arc/runner-scale-set-values.yaml — this job runs on
+    # an ephemeral pod inside the CCE cluster itself, not a GitHub-hosted runner, which is
+    # exactly what gives it network access to the private kube-apiserver.
+    runs-on: imto-arc-runners
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+      KUBECTL_VERSION: v1.31.4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # No kubeconfig/credentials step needed here on purpose — the runner pod already
+      # authenticates to this cluster's API server as imto-arc-runner-sa (platform/arc/rbac.yaml),
+      # via the in-cluster kubernetes.default.svc endpoint. That's the whole point of ARC.
+      #
+      # The runner image ships without kubectl. Installed into the runner's temp dir (no root
+      # needed) and checked against the official checksum. Needs outbound internet from the
+      # pod; the cluster has SNAT enabled.
+      - name: Install kubectl
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          chmod +x kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # Fails here, clearly, if the runner pod has no permission to deploy (RBAC missing or
+      # the pod is not running as imto-arc-runner-sa), instead of failing halfway through.
+      - name: Check cluster access
+        run: |
+          kubectl version --client
+          kubectl auth can-i create deployments -n default
+          kubectl auth can-i create httproutes.gateway.networking.k8s.io -n default
 
       - name: Pin manifests to this build's image tag
         run: |

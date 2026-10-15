@@ -1,11 +1,49 @@
-# What ARC's runner (and per-step job) pods are actually allowed to do — deliberately
-# scoped to the "default" namespace and the resources a deploy pipeline touches, not
-# cluster-admin. This is the RBAC layer that k8s/ never had until now.
+# What ARC's runner pods are actually allowed to do — deliberately scoped, not cluster-admin.
+# Applied by the CD pipeline's arc-bootstrap job.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: imto-arc-runner-sa
   namespace: arc-runners
+---
+# Same permissions ARC's chart would give its own kubernetes-mode service account. They are
+# needed here because we use our own service account (imto-arc-runner-sa), and the chart only
+# creates this Role when no serviceAccountName is set.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: imto-runner-kube-mode
+  namespace: arc-runners
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: imto-runner-kube-mode-binding
+  namespace: arc-runners
+subjects:
+  - kind: ServiceAccount
+    name: imto-arc-runner-sa
+    namespace: arc-runners
+roleRef:
+  kind: Role
+  name: imto-runner-kube-mode
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -28,9 +66,8 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Explicitly NOT granted: write access to Secrets (credentials arrive via CSMS/dew-provider,
-  # never via a pipeline-written K8s Secret), anything in envoy-gateway-system (the Gateway
-  # itself), and any cluster-scoped resource.
+  # Explicitly NOT granted: write access to Secrets, anything in envoy-gateway-system, and any
+  # cluster-scoped resource.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -45,3 +82,54 @@ roleRef:
   kind: Role
   name: imto-deployer
   apiGroup: rbac.authorization.k8s.io
+
+
+
+
+# # What ARC's runner (and per-step job) pods are actually allowed to do — deliberately
+# # scoped to the "default" namespace and the resources a deploy pipeline touches, not
+# # cluster-admin. This is the RBAC layer that k8s/ never had until now.
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata:
+#   name: imto-arc-runner-sa
+#   namespace: arc-runners
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: imto-deployer
+#   namespace: default
+# rules:
+#   - apiGroups: ["apps"]
+#     resources: ["deployments"]
+#     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#   - apiGroups: [""]
+#     resources: ["services", "serviceaccounts"]
+#     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#   - apiGroups: ["autoscaling"]
+#     resources: ["horizontalpodautoscalers"]
+#     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#   - apiGroups: ["secrets-store.csi.x-k8s.io"]
+#     resources: ["secretproviderclasses"]
+#     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#   - apiGroups: ["gateway.networking.k8s.io"]
+#     resources: ["httproutes"]
+#     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#   # Explicitly NOT granted: write access to Secrets (credentials arrive via CSMS/dew-provider,
+#   # never via a pipeline-written K8s Secret), anything in envoy-gateway-system (the Gateway
+#   # itself), and any cluster-scoped resource.
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: imto-deployer-binding
+#   namespace: default
+# subjects:
+#   - kind: ServiceAccount
+#     name: imto-arc-runner-sa
+#     namespace: arc-runners
+# roleRef:
+#   kind: Role
+#   name: imto-deployer
+#   apiGroup: rbac.authorization.k8s.io

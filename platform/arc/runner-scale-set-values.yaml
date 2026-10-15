@@ -1,14 +1,16 @@
 # Values for oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 #
-# REPLACE before installing: point at your actual repo (or drop the repo path for an
-# org-wide scale set — needs the GitHub App installed org-wide + the Self-hosted runners
-# org permission from platform/arc/README.md step 1).
-githubConfigUrl: "https://github.com/REPLACE_WITH_ORG/REPLACE_WITH_REPO"
+# githubConfigUrl is overridden by the CD pipeline (helm --set) with this repository's URL, so
+# the placeholder below is never used. To serve your whole org instead, change the --set in
+# .github/workflows/cd.yaml to the org URL (needs the GitHub token to cover the org, with the
+# Self-hosted runners org permission).
+githubConfigUrl: "https://github.com/REPLACED_BY_PIPELINE"
 
-# References the Secret created in platform/arc/README.md step 2 — no credential lives here.
+# References the Secret the CD pipeline creates from the ARC_GITHUB_TOKEN repository secret
+# (key: github_token) — no credential lives here.
 githubConfigSecret: imto-arc-github-app
 
-# This becomes the `runs-on:` label workflows use — see .github/workflows/deploy.yml.
+# This becomes the `runs-on:` label workflows use — see .github/workflows/cd.yaml.
 runnerScaleSetName: imto-arc-runners
 
 minRunners: 0 # scale to zero when idle — CCE Autopilot bills per pod, no CI activity = no cost
@@ -26,6 +28,11 @@ template:
       - name: runner
         image: ghcr.io/actions/actions-runner:latest
         command: ["/home/runner/run.sh"]
+        env:
+          # Lets the deploy job run its steps directly in the runner pod (as imto-arc-runner-sa)
+          # instead of ARC demanding a separate job container for every job.
+          - name: ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER
+            value: "false"
         resources:
           requests:
             cpu: "250m"
