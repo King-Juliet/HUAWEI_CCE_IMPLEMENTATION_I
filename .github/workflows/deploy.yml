@@ -27,12 +27,16 @@ jobs:
       HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
       AWS_ACCESS_KEY_ID: ${{ secrets.HW_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
 
       - name: Download Terraform plan from CI run
         id: download
@@ -45,9 +49,6 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id }}
 
-      # Always runs now — not just when there's a plan to apply — because this job
-      # also needs to read the IAM project name back out of state further down,
-      # even on a run where infrastructure didn't change.
       - name: Terraform init
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform init
@@ -61,6 +62,17 @@ jobs:
         id: project_name
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: echo "value=$(terraform output -raw swr_login_project_name)" >> "$GITHUB_OUTPUT"
+
+      # If an apply ever fails to save state again, this keeps the file instead of losing
+      # it with the runner. It contains your generated DB passwords in plain text, so it
+      # is kept for 1 day only. Download it, then run `terraform state push errored.tfstate`.
+      - name: Keep errored state if it could not be saved
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: errored-tfstate
+          path: ${{ env.TF_WORKING_DIR }}/errored.tfstate
+          retention-days: 1
 
   build-and-push:
     needs: terraform-apply

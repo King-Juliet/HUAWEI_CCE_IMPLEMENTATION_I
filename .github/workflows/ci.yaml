@@ -19,22 +19,26 @@ jobs:
       HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
       AWS_ACCESS_KEY_ID: ${{ secrets.HW_ACCESS_KEY }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.HW_SECRET_KEY }}
+      # Stops Terraform's S3 backend adding AWS-only upload checksums that OBS rejects
+      # (XAmzContentSHA256Mismatch). Tested against OBS with a scratch state.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
+      # Pinned to the version you ran locally. A saved plan must also be applied by the
+      # same Terraform version that created it, and CD runs minutes later.
       - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
 
       - name: Terraform fmt check
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform fmt -check
 
-      # -backend=false means this init never talks to OBS or Huawei at all — it only
-      # downloads the provider plugin locally so Terraform can check your syntax and
-      # resource schemas against it. No state read, no API call, no credentials used.
-      # Pure "is this code even valid" check.
       - name: Terraform init (no backend)
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform init -backend=false
@@ -53,9 +57,6 @@ jobs:
             echo "infra_changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # This init is the real one — it connects to the OBS backend to read/lock state,
-      # which is why it needs the credentials above. Only runs if something actually
-      # changed, and only to produce a plan — apply happens later, in CD.
       - name: Terraform init (with backend)
         if: steps.changes.outputs.infra_changed == 'true'
         working-directory: ${{ env.TF_WORKING_DIR }}
@@ -66,8 +67,6 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform plan -out=tfplan
 
-      # Hand the plan off as a build artifact so CD can pick it up and apply the exact
-      # same plan CI just produced — never re-plan and apply something CD computed itself.
       - name: Upload Terraform plan
         if: steps.changes.outputs.infra_changed == 'true'
         uses: actions/upload-artifact@v4
