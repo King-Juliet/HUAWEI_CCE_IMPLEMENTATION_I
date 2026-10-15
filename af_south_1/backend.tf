@@ -5,11 +5,11 @@
 #     path = "terraform.tfstate"
 #   }
 # }
-  terraform {
+terraform {
   backend "s3" {
-    bucket     = "juliet-terraform-backend"
-    key        = "terraform/state.tfstate"
-    region     = "af-south-1"
+    bucket = "juliet-terraform-backend"
+    key    = "terraform/state.tfstate"
+    region = "af-south-1"
 
     endpoints = {
       s3 = "https://obs.af-south-1.myhuaweicloud.com"
