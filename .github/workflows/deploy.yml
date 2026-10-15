@@ -8,7 +8,7 @@ on:
 
 # One CD run at a time: they all read and write the same Terraform state.
 concurrency:
-  group: cd-main
+  group: cd-main-v2
   cancel-in-progress: false
 
 env:
@@ -281,9 +281,10 @@ jobs:
 
   deploy:
     needs: [terraform-apply, build-and-push, arc-bootstrap]
-    # arc-bootstrap is skipped on most runs; always() stops that skip from skipping deploy too.
+    # arc-bootstrap is skipped on most runs; !cancelled() stops that skip from skipping deploy too,
+    # and (unlike always()) it lets the Cancel button actually stop this job.
     if: >
-      always() &&
+      !cancelled() &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       needs.terraform-apply.result == 'success' &&

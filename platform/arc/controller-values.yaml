@@ -1,6 +1,6 @@
 # Values for oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
 # One controller serves every runner scale set in the cluster — install once.
-# "# Installed by the CD pipeline (arc-bootstrap job)."
+# "# ARC install trigger 2"
 replicaCount: 1
 
 resources:
