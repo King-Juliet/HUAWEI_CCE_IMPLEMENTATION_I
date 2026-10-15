@@ -1,5 +1,7 @@
-# What ARC's runner pods are actually allowed to do — deliberately scoped, not cluster-admin.
-# Applied by the CD pipeline's arc-bootstrap job.
+# What ARC's runner (and per-step job) pods are actually allowed to do — deliberately scoped to
+# the "default" namespace, the Gateway objects in envoy-gateway-system, and the resources a deploy
+# pipeline touches, not cluster-admin. This is the RBAC layer that k8s/ never had until now.
+# Applied automatically by the CD pipeline's arc-bootstrap job.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -54,6 +56,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only: `kubectl rollout status` / `rollout undo` look at the ReplicaSets behind a Deployment.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["services", "serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -66,8 +72,9 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Explicitly NOT granted: write access to Secrets, anything in envoy-gateway-system, and any
-  # cluster-scoped resource.
+  # Explicitly NOT granted: write access to Secrets (credentials arrive via CSMS/dew-provider,
+  # never via a pipeline-written K8s Secret). The Gateway objects and the GatewayClass are
+  # granted separately below, because the deploy job applies k8s/envoy-gateway*.yaml.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -82,7 +89,59 @@ roleRef:
   kind: Role
   name: imto-deployer
   apiGroup: rbac.authorization.k8s.io
-
+---
+# The deploy job applies k8s/envoy-gateway.yaml (a Gateway) and the EnvoyProxy half of
+# k8s/envoy-gatewayclass.yaml, both in envoy-gateway-system. Only those two kinds, nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: imto-gateway-editor
+  namespace: envoy-gateway-system
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["gateway.envoyproxy.io"]
+    resources: ["envoyproxies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: imto-gateway-editor-binding
+  namespace: envoy-gateway-system
+subjects:
+  - kind: ServiceAccount
+    name: imto-arc-runner-sa
+    namespace: arc-runners
+roleRef:
+  kind: Role
+  name: imto-gateway-editor
+  apiGroup: rbac.authorization.k8s.io
+---
+# GatewayClass is cluster-scoped, so a namespaced Role cannot grant it. This is the only
+# cluster-scoped permission the runner gets, and it is limited to GatewayClass objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: imto-gatewayclass-editor
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: imto-gatewayclass-editor-binding
+subjects:
+  - kind: ServiceAccount
+    name: imto-arc-runner-sa
+    namespace: arc-runners
+roleRef:
+  kind: ClusterRole
+  name: imto-gatewayclass-editor
+  apiGroup: rbac.authorization.k8s.io
 
 
 

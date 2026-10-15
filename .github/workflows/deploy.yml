@@ -265,6 +265,9 @@ jobs:
           [ -n "$ARC_GITHUB_TOKEN" ] || { echo "::error::repository secret ARC_GITHUB_TOKEN is missing"; exit 1; }
           kubectl create namespace arc-systems --dry-run=client -o yaml | kubectl apply -f -
           kubectl create namespace arc-runners --dry-run=client -o yaml | kubectl apply -f -
+          # rbac.yaml grants Gateway permissions in this namespace, so it must exist first
+          # (harmless if Envoy Gateway already created it).
+          kubectl create namespace envoy-gateway-system --dry-run=client -o yaml | kubectl apply -f -
           kubectl create secret generic imto-arc-github-app \
             --namespace arc-runners \
             --from-literal=github_token="$ARC_GITHUB_TOKEN" \
@@ -305,6 +308,11 @@ jobs:
           kubectl logs -n arc-systems -l app.kubernetes.io/name=gha-rs-controller --tail=80 || true
           exit 1
 
+      # If anything above failed, print the cluster state into this log while access is still open.
+      - name: Capture cluster diagnostics
+        if: failure()
+        run: bash .github/scripts/arc-diagnose.sh
+
       - name: Close temporary API access
         if: always()
         working-directory: ${{ env.TF_WORKING_DIR }}
@@ -330,6 +338,122 @@ jobs:
           path: ${{ env.TF_WORKING_DIR }}/errored.tfstate
           retention-days: 1
           if-no-files-found: ignore
+
+  # Watches the deploy job. The runner pod only exists once deploy is queued, and by then
+  # arc-bootstrap has closed the API again, so this job does its own open -> capture -> close.
+  # If deploy has not finished its first step within 8 minutes, it opens temporary API access,
+  # prints pod status, events and logs into this job's log, then closes access again.
+  # If deploy starts normally, this job ends within seconds and never touches the cluster.
+  runner-diagnostics:
+    needs: [terraform-apply, build-and-push, arc-bootstrap]
+    if: >
+      !cancelled() &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      needs.terraform-apply.result == 'success' &&
+      needs.build-and-push.result == 'success' &&
+      (needs.arc-bootstrap.result == 'success' || needs.arc-bootstrap.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    env:
+      HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
+      HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.HW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Wait for deploy to start on a runner
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          URL="repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs"
+          for i in $(seq 1 24); do
+            STATUS=$(gh api "$URL" --jq '.jobs[] | select(.name=="deploy") | .status')
+            DONE=$(gh api "$URL" --jq '[.jobs[] | select(.name=="deploy") | .steps[]? | select(.status=="completed")] | length')
+            echo "deploy status: ${STATUS:-unknown}, steps completed: ${DONE:-0} ($i/24)"
+            if [ "$STATUS" = "completed" ] || [ "${DONE:-0}" -gt 0 ]; then
+              echo "deploy is running or finished - no diagnostics needed."
+              echo "stuck=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::deploy has not started running after 8 minutes - capturing cluster diagnostics."
+          echo "stuck=true" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.wait.outputs.stuck == 'true'
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      - name: Terraform init
+        if: steps.wait.outputs.stuck == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Open temporary API access
+        if: steps.wait.outputs.stuck == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -var="cluster_public_access=true"
+
+      - name: Fetch short-lived kubeconfig
+        if: steps.wait.outputs.stuck == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set -e
+          terraform output -raw bootstrap_kubeconfig > "$RUNNER_TEMP/kubeconfig"
+          chmod 600 "$RUNNER_TEMP/kubeconfig"
+          [ -s "$RUNNER_TEMP/kubeconfig" ] || { echo "::error::kubeconfig is empty"; exit 1; }
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Wait for the API server to answer
+        if: steps.wait.outputs.stuck == 'true'
+        run: |
+          kubectl config use-context external
+          OK=0
+          for i in $(seq 1 60); do
+            if kubectl get --raw /readyz > /dev/null 2>&1 && kubectl get --raw /openapi/v2 > /dev/null 2>&1; then
+              OK=$((OK+1))
+              echo "API server answered ($OK/3)"
+              [ "$OK" -ge 3 ] && exit 0
+            else
+              OK=0
+              echo "not reachable yet ($i/60)"
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Capture cluster diagnostics
+        if: steps.wait.outputs.stuck == 'true'
+        run: bash .github/scripts/arc-diagnose.sh
+
+      - name: Close temporary API access
+        if: always() && steps.wait.outputs.stuck == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          rm -f "$RUNNER_TEMP/kubeconfig"
+          # 1) detach the EIP from the cluster; keep_temp_eip stops Terraform deleting it in the same apply
+          terraform apply -auto-approve -var="keep_temp_eip=true"
+          # 2) then delete the now-unattached EIP; retry because the detach finishes in the background
+          for i in $(seq 1 10); do
+            if terraform apply -auto-approve; then
+              echo "API server is private again."
+              exit 0
+            fi
+            echo "EIP still busy, retrying ($i/10)"; sleep 30
+          done
+          exit 1
 
   deploy:
     needs: [terraform-apply, build-and-push, arc-bootstrap]
@@ -381,7 +505,14 @@ jobs:
           kubectl version --client
           kubectl auth can-i create deployments -n default
           kubectl auth can-i create httproutes.gateway.networking.k8s.io -n default
+          kubectl auth can-i list replicasets.apps -n default
+          kubectl auth can-i create gateways.gateway.networking.k8s.io -n envoy-gateway-system
+          kubectl auth can-i create gatewayclasses.gateway.networking.k8s.io
 
+      # Inside the cluster, kubectl's default namespace is the one the runner pod lives in
+      # (arc-runners), not "default". So every command that targets the app says -n default.
+      # The Gateway/EnvoyProxy/HTTPRoute manifests already name their own namespace, so those
+      # three applies must NOT pass -n (kubectl rejects a mismatch).
       - name: Pin manifests to this build's image tag
         run: |
           set -e
@@ -398,16 +529,16 @@ jobs:
 
       - name: Apply backend manifests
         run: |
-          kubectl apply -f k8s/backend-serviceaccount.yaml
-          kubectl apply -f k8s/backend-secretproviderclass.yaml
-          kubectl apply -f k8s/backend-deployments.yaml
-          kubectl apply -f k8s/backend-service.yaml
-          kubectl apply -f k8s/backend-hpa.yaml
+          kubectl apply -n default -f k8s/backend-serviceaccount.yaml
+          kubectl apply -n default -f k8s/backend-secretproviderclass.yaml
+          kubectl apply -n default -f k8s/backend-deployments.yaml
+          kubectl apply -n default -f k8s/backend-service.yaml
+          kubectl apply -n default -f k8s/backend-hpa.yaml
 
       - name: Apply frontend manifests
         run: |
-          kubectl apply -f k8s/frontend-deployment.yaml
-          kubectl apply -f k8s/frontend-service.yaml
+          kubectl apply -n default -f k8s/frontend-deployment.yaml
+          kubectl apply -n default -f k8s/frontend-service.yaml
 
       - name: Apply Envoy Gateway routing
         run: |
@@ -417,11 +548,11 @@ jobs:
 
       - name: Wait for rollout
         run: |
-          kubectl rollout status deployment/imto-test-backend --timeout=120s
-          kubectl rollout status deployment/imto-test-frontend --timeout=120s
+          kubectl rollout status deployment/imto-test-backend -n default --timeout=120s
+          kubectl rollout status deployment/imto-test-frontend -n default --timeout=120s
 
       - name: Roll back on failed deploy
         if: failure()
         run: |
-          kubectl rollout undo deployment/imto-test-backend
-          kubectl rollout undo deployment/imto-test-frontend
+          kubectl rollout undo deployment/imto-test-backend -n default
+          kubectl rollout undo deployment/imto-test-frontend -n default
