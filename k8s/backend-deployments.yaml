@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imto-test-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: imto-test-backend
+  template:
+    metadata:
+      labels:
+        app: imto-test-backend
+    spec:
+      serviceAccountName: imto-backend-sa   # links this pod to the CSMS permissions declared above
+      imagePullSecrets:
+        # Auto-created by CCE in every namespace, holding a rotating SWR pull credential for
+        # this account's own registry — required since the imto-test-backend repo is private
+        # (is_public = false in swr.tf); without this, pulls are attempted anonymously and
+        # SWR returns 401 Unauthorized on the token request itself.
+        - name: default-secret
+      containers:
+        - name: backend
+          image: swr.af-south-1.myhuaweicloud.com/juliet-cce/imto-test-backend:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            # Same envFrom pattern as before — the only change is that this
+            # Secret is now created and kept in sync by dew-provider, never
+            # written by hand.
+            - secretRef:
+                name: imto-test-db-credentials-synced
+          env:
+            - name: FRONTEND_ORIGIN
+              value: "http://imto-test-frontend-svc:3000"
+            - name: DB_SSL_MODE
+              value: "Require"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            # Required even though we're consuming the synced Secret via
+            # envFrom — the docs are explicit that the synced K8s Secret only
+            # exists while a pod is actively mounting this CSI volume; it
+            # gets deleted the moment the last consuming pod is gone.
+            - name: csms-secrets
+              mountPath: "/mnt/csms-secrets"
+              readOnly: true
+      volumes:
+        - name: csms-secrets
+          csi:
+            # Driver name has no "x-" (unlike the SecretProviderClass's own
+            # apiVersion group, which does) — confirmed against Huawei's own
+            # CCE Secrets Manager for DEW docs (cce_10_0370.html).
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "spc-imto-db"

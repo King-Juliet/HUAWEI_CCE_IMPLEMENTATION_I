@@ -1,0 +1,12 @@
+# Values for oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+# One controller serves every runner scale set in the cluster — install once.
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "250m"
+    memory: "256Mi"

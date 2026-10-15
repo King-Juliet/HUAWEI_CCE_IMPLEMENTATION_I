@@ -1,0 +1,166 @@
+name: CD - Build, Push, Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI - Terraform Infrastructure"]
+    types: [completed]
+    branches: [main]
+
+env:
+  SWR_REGISTRY: swr.af-south-1.myhuaweicloud.com
+  SWR_ORGANIZATION: juliet-cce
+  TF_WORKING_DIR: af_south_1
+
+jobs:
+  terraform-apply:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      swr_project_name: ${{ steps.project_name.outputs.value }}
+    env:
+      HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
+      HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.HW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.HW_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Download Terraform plan from CI run
+        id: download
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      # Always runs now — not just when there's a plan to apply — because this job
+      # also needs to read the IAM project name back out of state further down,
+      # even on a run where infrastructure didn't change.
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform apply
+        if: steps.download.outcome == 'success'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Read SWR login project name from Terraform state
+        id: project_name
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: echo "value=$(terraform output -raw swr_login_project_name)" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: terraform-apply
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image_tag: ${{ steps.vars.outputs.tag }}
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute image tag
+        id: vars
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute SWR login credentials
+        id: swr_auth
+        env:
+          HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
+          HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
+          SWR_PROJECT_NAME: ${{ needs.terraform-apply.outputs.swr_project_name }}
+        run: |
+          LOGIN_KEY=$(printf "%s" "$HW_ACCESS_KEY" | openssl dgst -binary -sha256 -hmac "$HW_SECRET_KEY" | od -An -vtx1 | sed 's/[ \n]//g' | sed 'N;s/\n//')
+          echo "::add-mask::$LOGIN_KEY"
+          echo "username=${SWR_PROJECT_NAME}@${HW_ACCESS_KEY}" >> "$GITHUB_OUTPUT"
+          echo "password=$LOGIN_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to SWR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SWR_REGISTRY }}
+          username: ${{ steps.swr_auth.outputs.username }}
+          password: ${{ steps.swr_auth.outputs.password }}
+
+      - name: Build and push ${{ matrix.component }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: test_app/${{ matrix.component }}
+          file: test_app/${{ matrix.component }}/Dockerfile
+          push: true
+          tags: ${{ env.SWR_REGISTRY }}/${{ env.SWR_ORGANIZATION }}/imto-test-${{ matrix.component }}:${{ steps.vars.outputs.tag }}
+
+  deploy:
+    needs: [terraform-apply, build-and-push]
+    runs-on: imto-arc-runners
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Pin manifests to this build's image tag
+        run: |
+          set -e
+          BACKEND_IMAGE="${SWR_REGISTRY}/${SWR_ORGANIZATION}/imto-test-backend"
+          FRONTEND_IMAGE="${SWR_REGISTRY}/${SWR_ORGANIZATION}/imto-test-frontend"
+
+          grep -q "${BACKEND_IMAGE}:latest" k8s/backend-deployments.yaml \
+            || { echo "::error::expected image '${BACKEND_IMAGE}:latest' not found in backend-deployments.yaml"; exit 1; }
+          grep -q "${FRONTEND_IMAGE}:latest" k8s/frontend-deployment.yaml \
+            || { echo "::error::expected image '${FRONTEND_IMAGE}:latest' not found in frontend-deployment.yaml"; exit 1; }
+
+          sed -i "s#${BACKEND_IMAGE}:latest#${BACKEND_IMAGE}:${IMAGE_TAG}#" k8s/backend-deployments.yaml
+          sed -i "s#${FRONTEND_IMAGE}:latest#${FRONTEND_IMAGE}:${IMAGE_TAG}#" k8s/frontend-deployment.yaml
+
+      - name: Apply backend manifests
+        run: |
+          kubectl apply -f k8s/backend-serviceaccount.yaml
+          kubectl apply -f k8s/backend-secretproviderclass.yaml
+          kubectl apply -f k8s/backend-deployments.yaml
+          kubectl apply -f k8s/backend-service.yaml
+          kubectl apply -f k8s/backend-hpa.yaml
+
+      - name: Apply frontend manifests
+        run: |
+          kubectl apply -f k8s/frontend-deployment.yaml
+          kubectl apply -f k8s/frontend-service.yaml
+
+      - name: Apply Envoy Gateway routing
+        run: |
+          kubectl apply -f k8s/envoy-gatewayclass.yaml
+          kubectl apply -f k8s/envoy-gateway.yaml
+          kubectl apply -f k8s/frontend-httproute.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/imto-test-backend --timeout=120s
+          kubectl rollout status deployment/imto-test-frontend --timeout=120s
+
+      - name: Roll back on failed deploy
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/imto-test-backend
+          kubectl rollout undo deployment/imto-test-frontend

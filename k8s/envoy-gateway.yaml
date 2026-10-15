@@ -1,0 +1,20 @@
+# The actual Gateway — one HTTP listener on :80, accepting routes from any namespace so
+# frontend/backend HTTPRoutes don't have to live in envoy-gateway-system.
+#
+# HTTP only for now: adding :443/TLS needs a certificate (e.g. via Huawei SCM or
+# cert-manager) turned into a Kubernetes TLS Secret referenced by a second listener —
+# not set up anywhere in this repo yet, so deliberately left out rather than guessed at.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: imto-gateway
+  namespace: envoy-gateway-system
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All

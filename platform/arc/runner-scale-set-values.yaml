@@ -1,0 +1,35 @@
+# Values for oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+#
+# REPLACE before installing: point at your actual repo (or drop the repo path for an
+# org-wide scale set — needs the GitHub App installed org-wide + the Self-hosted runners
+# org permission from platform/arc/README.md step 1).
+githubConfigUrl: "https://github.com/REPLACE_WITH_ORG/REPLACE_WITH_REPO"
+
+# References the Secret created in platform/arc/README.md step 2 — no credential lives here.
+githubConfigSecret: imto-arc-github-app
+
+# This becomes the `runs-on:` label workflows use — see .github/workflows/deploy.yml.
+runnerScaleSetName: imto-arc-runners
+
+minRunners: 0 # scale to zero when idle — CCE Autopilot bills per pod, no CI activity = no cost
+maxRunners: 3 # starter concurrency cap — raise once real pipeline volume is known
+
+containerMode:
+  type: kubernetes # each job step needing its own container gets a pod, rather than a privileged DinD sidecar
+
+template:
+  spec:
+    # Ties runner (and job) pods to the deploy-scoped RBAC in platform/arc/rbac.yaml — never
+    # cluster-admin.
+    serviceAccountName: imto-arc-runner-sa
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command: ["/home/runner/run.sh"]
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"

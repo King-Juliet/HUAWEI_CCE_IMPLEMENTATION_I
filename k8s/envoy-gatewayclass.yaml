@@ -1,0 +1,45 @@
+# Requires Envoy Gateway itself to already be installed via Helm (see cce.tf's addons
+# comment block for the exact command) — these CRDs don't exist until it's installed.
+#
+# GatewayClass + EnvoyProxy together are what bind Envoy Gateway's auto-managed Service
+# to the pre-existing public ELB from elb.tf, instead of it provisioning its own new one.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: eg-proxy-config
+    namespace: envoy-gateway-system
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: eg-proxy-config
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+        # REQUIRED on CCE Autopilot — its webhook rejects "Local" ("externalTrafficPolicy
+        # of service must be Cluster in CCE autopilot"). Trade-off: client source IP isn't
+        # preserved at the pod under "Cluster"; if you need it, use the ELB's own
+        # X-Forwarded-For / pass-through settings rather than Local.
+        externalTrafficPolicy: Cluster
+        annotations:
+          # REQUIRED on CCE Autopilot — its admission webhook rejects any LoadBalancer
+          # Service without this ("elb class must be performance in autopilot scenario").
+          # "performance" = dedicated ELB v3, which is what modules/elb provisions.
+          kubernetes.io/elb.class: performance
+          # The real ELB id — run `terraform output -raw elb_id` from af_south_1/ (see
+          # elb.tf). This is what makes CCE's cloud-controller-manager attach Envoy
+          # Gateway's Service to the pre-existing ELB instead of provisioning a new one.
+          kubernetes.io/elb.id: "a83264f9-bd1e-4570-b085-70ff68b54a68"
+          # Confirm any further annotations you need (session affinity, health check,
+          # algorithm) against Huawei's LoadBalancer Service annotation docs before relying
+          # on non-default behavior — only these two are confirmed necessary here.

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: imto-test-frontend-svc
+spec:
+  selector:
+    app: imto-test-frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+  # ClusterIP, not LoadBalancer: external access goes through Envoy Gateway
+  # (see k8s/envoy-gateway-*.yaml), which is what's actually bound to the
+  # pre-created public ELB from elb.tf. A LoadBalancer type here would make
+  # Huawei's cloud-controller-manager provision (or bind) its own separate
+  # ELB for this Service directly, bypassing Envoy Gateway entirely.
+  type: ClusterIP

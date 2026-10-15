@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5432:5432"
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8080:8080"
+    environment:
+      FRONTEND_ORIGIN: "http://localhost:3000"
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_SSL_MODE: "Disable"
+    depends_on:
+      - postgres
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      # Since the fetch now happens server-side (inside the frontend
+      # container), it can reach the backend by its Docker Compose service
+      # name — "backend" — over Compose's internal network, the same way the
+      # frontend pod will reach the backend Service by name inside CCE.
+      BACKEND_URL: "http://backend:8080"
+    depends_on:
+      - backend

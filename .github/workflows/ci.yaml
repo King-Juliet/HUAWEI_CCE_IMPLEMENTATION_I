@@ -1,0 +1,77 @@
+name: CI - Terraform Infrastructure
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  TF_WORKING_DIR: af_south_1
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
+      HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.HW_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.HW_SECRET_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform fmt check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check
+
+      # -backend=false means this init never talks to OBS or Huawei at all — it only
+      # downloads the provider plugin locally so Terraform can check your syntax and
+      # resource schemas against it. No state read, no API call, no credentials used.
+      # Pure "is this code even valid" check.
+      - name: Terraform init (no backend)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Check if infrastructure files changed
+        id: changes
+        run: |
+          if git diff --name-only ${{ github.event.before || 'HEAD^' }} ${{ github.sha }} \
+             | grep -qE '^(af_south_1/|modules/)'; then
+            echo "infra_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "infra_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # This init is the real one — it connects to the OBS backend to read/lock state,
+      # which is why it needs the credentials above. Only runs if something actually
+      # changed, and only to produce a plan — apply happens later, in CD.
+      - name: Terraform init (with backend)
+        if: steps.changes.outputs.infra_changed == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform plan
+        if: steps.changes.outputs.infra_changed == 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -out=tfplan
+
+      # Hand the plan off as a build artifact so CD can pick it up and apply the exact
+      # same plan CI just produced — never re-plan and apply something CD computed itself.
+      - name: Upload Terraform plan
+        if: steps.changes.outputs.infra_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 1
