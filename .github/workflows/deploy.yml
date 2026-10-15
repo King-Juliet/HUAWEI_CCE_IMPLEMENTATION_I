@@ -45,6 +45,7 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.12.2
+          terraform_wrapper: false
 
       - name: Download Terraform plan from CI run
         id: download
@@ -89,7 +90,11 @@ jobs:
       - name: Read SWR login project name from Terraform state
         id: project_name
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: echo "value=$(terraform output -raw swr_login_project_name)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -e
+          NAME=$(terraform output -raw swr_login_project_name)
+          [ -n "$NAME" ] || { echo "::error::swr_login_project_name output is empty"; exit 1; }
+          echo "value=$NAME" >> "$GITHUB_OUTPUT"
 
       # If an apply ever fails to save state again, this keeps the file instead of losing
       # it with the runner. It contains your generated DB passwords in plain text, so it
@@ -176,6 +181,7 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.12.2
+          terraform_wrapper: false
 
       - name: Terraform init
         working-directory: ${{ env.TF_WORKING_DIR }}
