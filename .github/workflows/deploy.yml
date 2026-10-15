@@ -16,6 +16,7 @@ env:
   SWR_ORGANIZATION: juliet-cce
   TF_WORKING_DIR: af_south_1
   ARC_VERSION: 0.15.0
+  ENVOY_GATEWAY_VERSION: v1.9.2
 
 jobs:
   terraform-apply:
@@ -29,6 +30,7 @@ jobs:
     outputs:
       swr_project_name: ${{ steps.project_name.outputs.value }}
       bootstrap_arc: ${{ steps.arc.outputs.install }}
+      elb_id: ${{ steps.elb.outputs.value }}
     env:
       HW_ACCESS_KEY: ${{ secrets.HW_ACCESS_KEY }}
       HW_SECRET_KEY: ${{ secrets.HW_SECRET_KEY }}
@@ -130,6 +132,17 @@ jobs:
           NAME=$(terraform output -raw swr_login_project_name)
           [ -n "$NAME" ] || { echo "::error::swr_login_project_name output is empty"; exit 1; }
           echo "value=$NAME" >> "$GITHUB_OUTPUT"
+
+      # The ELB this stack created. The deploy job writes this id into the Envoy Gateway manifest so
+      # the Gateway's Service attaches to the right load balancer.
+      - name: Read ELB id from Terraform state
+        id: elb
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set -e
+          ID=$(terraform output -raw elb_id)
+          [ -n "$ID" ] || { echo "::error::elb_id output is empty"; exit 1; }
+          echo "value=$ID" >> "$GITHUB_OUTPUT"
 
       # If an apply ever fails to save state again, this keeps the file instead of losing
       # it with the runner. It contains your generated DB passwords in plain text, so it
@@ -307,6 +320,19 @@ jobs:
           kubectl get pods -A || true
           kubectl logs -n arc-systems -l app.kubernetes.io/name=gha-rs-controller --tail=80 || true
           exit 1
+
+      # Envoy Gateway is not a Huawei add-on, so the pipeline installs it here (same temporary
+      # access window). The chart brings the Gateway API CRDs with it, which the deploy job's
+      # Gateway/HTTPRoute manifests need. Safe to re-run: helm upgrade --install.
+      - name: Install Envoy Gateway
+        run: |
+          set -e
+          kubectl version | grep -i "server version" || true
+          helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+            --version "$ENVOY_GATEWAY_VERSION" \
+            --namespace envoy-gateway-system --create-namespace \
+            --timeout 8m
+          kubectl wait --timeout=5m -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
 
       # If anything above failed, print the cluster state into this log while access is still open.
       - name: Capture cluster diagnostics
@@ -540,6 +566,19 @@ jobs:
           kubectl apply -n default -f k8s/frontend-deployment.yaml
           kubectl apply -n default -f k8s/frontend-service.yaml
 
+      # k8s/envoy-gatewayclass.yaml carries an ELB id. Replace it with the ELB this Terraform stack
+      # actually manages, so it can never go stale.
+      - name: Point Envoy Gateway at this stack's ELB
+        env:
+          ELB_ID: ${{ needs.terraform-apply.outputs.elb_id }}
+        run: |
+          set -e
+          [ -n "$ELB_ID" ] || { echo "::error::elb_id from Terraform is empty"; exit 1; }
+          grep -q 'kubernetes.io/elb.id:' k8s/envoy-gatewayclass.yaml \
+            || { echo "::error::kubernetes.io/elb.id annotation not found in envoy-gatewayclass.yaml"; exit 1; }
+          sed -i -E "s#(kubernetes.io/elb.id: )\"[^\"]*\"#\1\"${ELB_ID}\"#" k8s/envoy-gatewayclass.yaml
+          grep 'kubernetes.io/elb.id' k8s/envoy-gatewayclass.yaml
+
       - name: Apply Envoy Gateway routing
         run: |
           kubectl apply -f k8s/envoy-gatewayclass.yaml
@@ -551,8 +590,14 @@ jobs:
           kubectl rollout status deployment/imto-test-backend -n default --timeout=120s
           kubectl rollout status deployment/imto-test-frontend -n default --timeout=120s
 
+      # Only rolls back deployments that exist (on a first deploy there is nothing to roll back to).
       - name: Roll back on failed deploy
         if: failure()
         run: |
-          kubectl rollout undo deployment/imto-test-backend -n default
-          kubectl rollout undo deployment/imto-test-frontend -n default
+          for d in imto-test-backend imto-test-frontend; do
+            if kubectl get deployment "$d" -n default > /dev/null 2>&1; then
+              kubectl rollout undo "deployment/$d" -n default || true
+            else
+              echo "$d does not exist yet - nothing to roll back"
+            fi
+          done
