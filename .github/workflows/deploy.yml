@@ -82,10 +82,18 @@ jobs:
           fi
           echo "install=$INSTALL" >> "$GITHUB_OUTPUT"
 
+      # If a previous run left the temporary API IP half-detached, the saved plan can fail with
+      # a "conflict" while Huawei finishes detaching it. Wait a minute and apply once more with a
+      # fresh plan, which sees the real current state.
       - name: Terraform apply
         if: steps.download.outcome == 'success'
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform apply -auto-approve tfplan
+        run: |
+          terraform apply -auto-approve tfplan || {
+            echo "Saved plan failed - waiting 60s, then retrying with a fresh plan."
+            sleep 60
+            terraform apply -auto-approve
+          }
 
       - name: Read SWR login project name from Terraform state
         id: project_name
@@ -207,9 +215,17 @@ jobs:
         run: |
           kubectl config get-contexts
           kubectl config use-context external
-          for i in $(seq 1 30); do
-            if kubectl get --raw /readyz > /dev/null 2>&1; then echo "API server reachable"; exit 0; fi
-            echo "not reachable yet ($i/30)"; sleep 10
+          OK=0
+          for i in $(seq 1 60); do
+            if kubectl get --raw /readyz > /dev/null 2>&1 && kubectl get --raw /openapi/v2 > /dev/null 2>&1; then
+              OK=$((OK+1))
+              echo "API server answered ($OK/3)"
+              [ "$OK" -ge 3 ] && exit 0
+            else
+              OK=0
+              echo "not reachable yet ($i/60)"
+            fi
+            sleep 10
           done
           kubectl get --raw /readyz || true
           exit 1
@@ -267,8 +283,17 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           rm -f "$RUNNER_TEMP/kubeconfig"
-          terraform apply -auto-approve
-          echo "API server is private again."
+          # 1) detach the EIP from the cluster first, on its own
+          terraform apply -auto-approve -target=module.juliet_cce_autopilot.huaweicloud_cce_autopilot_cluster.prod_k8s
+          # 2) then delete the now-unattached EIP; retry because the detach finishes in the background
+          for i in $(seq 1 10); do
+            if terraform apply -auto-approve; then
+              echo "API server is private again."
+              exit 0
+            fi
+            echo "EIP still busy, retrying ($i/10)"; sleep 30
+          done
+          exit 1
 
       - name: Keep errored state if it could not be saved
         if: failure()
